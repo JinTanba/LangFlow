@@ -1,0 +1,157 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+/* ===== Enums ===== */
+
+enum FlowRunStatus {
+  queued
+  running
+  waiting
+  completed
+  failed
+}
+
+enum NodeType {
+  program
+  ai
+  human
+}
+
+enum NodeRunStatus {
+  queued
+  running
+  ok
+  error
+  skipped
+  waiting_human
+}
+
+enum HumanTaskStatus {
+  pending
+  submitted
+  expired
+  canceled
+}
+
+/* ===== Models ===== */
+
+// Flow定義：ノードはインライン。順序はrequiresで表現。
+// 各ノードには input_schema / output_schema（JSON Schema）を必ず持たせる。
+model Flow {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  name      String
+  version   Int
+  // NodeDoc[] を格納する。各要素は:
+  // { key, kind, title?, description?, requires?: string[],
+  //   input_schema: {...JSON Schema...}, output_schema: {...JSON Schema...},
+  //   endpoint?/model?/ui_hint?/blocking?/timeout_sec? ... }
+  nodes     Json
+
+  flowRuns  FlowRun[] // Opposite relation to FlowRun
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name, version])
+}
+
+// 各Flowの実行。Contextを常時保存し、外部からここを参照して進捗を把握する。
+model FlowRun {
+  id        String         @id @default(auto()) @map("_id") @db.ObjectId
+  flowId    String         @db.ObjectId
+  flow      Flow           @relation(fields: [flowId], references: [id])
+
+  status    FlowRunStatus  @default(queued)
+  input     Json           // 実行開始入力
+  // 実行状況。{ vars: {}, node_results: { [nodeKey]: { status, output?, error?, finishedAt? } }, started_at, updated_at, ... }
+  context   Json
+
+  humanTasks  HumanTask[]   // Opposite relation to HumanTask
+  nodeRuns    NodeRun[]     // Opposite relation to NodeRun
+  decisionLogs DecisionLog[] // Opposite relation to DecisionLog
+
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@index([flowId])
+  @@index([status, updatedAt])
+}
+
+// 各ノードの実行履歴。スキップや人間待ちも正規の状態として記録。
+model NodeRun {
+  id         String        @id @default(auto()) @map("_id") @db.ObjectId
+  flowRunId  String        @db.ObjectId
+  flowRun    FlowRun       @relation(fields: [flowRunId], references: [id])
+
+  nodeKey    String
+  nodeType   NodeType
+  status     NodeRunStatus
+
+  input      Json?
+  output     Json?
+  error      Json?
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  @@index([flowRunId])
+  @@index([flowRunId, nodeKey])
+  @@index([status, finishedAt])
+}
+
+// 人間待ち（HumanNode）。token でマジックリンク運用可能。
+model HumanTask {
+  id         String           @id @default(auto()) @map("_id") @db.ObjectId
+  flowRunId  String           @db.ObjectId
+  flowRun    FlowRun          @relation(fields: [flowRunId], references: [id])
+
+  nodeKey    String
+  status     HumanTaskStatus  @default(pending)
+
+  message    String?
+  fields     Json?            // UIフォームの簡易定義
+  prefill    Json?            // 初期値（EdgeLLMや直前ノードが提示）
+  result     Json?            // 提出結果（= HumanNodeの出力）
+
+  assignees  String[]         // メールやユーザID
+  blocking   Boolean          @default(true)
+  token      String           @unique
+  expiresAt  DateTime?
+
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  @@index([flowRunId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// edgeLLMの判断ログ（監査・再現用）
+model DecisionLog {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  flowRunId  String   @db.ObjectId
+  flowRun    FlowRun  @relation(fields: [flowRunId], references: [id])
+
+  atNodeKey  String?
+  decision   Json     // { mode, next: [{nodeKey,input, human?}], skips?: string[], reason?: string }
+
+  createdAt  DateTime @default(now())
+
+  @@index([flowRunId])
+  @@index([createdAt])
+}
