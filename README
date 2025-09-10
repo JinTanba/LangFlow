@@ -1,0 +1,315 @@
+# Langflow — Architecture (MVP)
+
+**Stack:** Node.js, TypeScript, Prisma, MongoDB Atlas
+**Layers:** `application` (usecases, services, repositories) and `infrastructure` (adapters).
+**Domain:** Prisma‑generated client only (no handwritten domain layer).
+**Goal:** Execute developer‑defined flows (DAGs) with inline node definitions and formal JSON Schemas. At runtime, an **edge LLM** decides which ready nodes to run and produces typed inputs for them. Human-in-the-loop pauses are first‑class via a `human` node.
+
+---
+
+## 1) Scope and Non‑Goals
+
+### In scope (MVP)
+
+* Flow definition stored as a **single JSON document** with nodes inlined.
+* Execution order via `requires: string[]` on nodes (joins by listing multiple prerequisites).
+* Three node kinds:
+
+  * `program`: invoke external HTTP endpoint.
+  * `ai`: invoke an LLM and expect JSON.
+  * `human`: pause run, collect human input, then resume.
+* **Context persisted** to DB and updated after every node completion so external callers can read live status.
+* Node I/O described by **formal JSON Schema (2020‑12)** embedded in each node.
+* A single usecase, **FlowOrchestrator**, owns the full lifecycle (start, decide, dispatch, pause, resume, complete).
+  Separate “StartFlowRun” or “DecideNext” usecases are not used.
+* Minimal supporting usecases:
+
+  * **SubmitHumanTask** (accept human input and resume)
+  * **GetRunStatus** (read-only status)
+
+### Out of scope (MVP)
+
+* Notifications (email/Slack), RBAC/tenancy, cost controls, dashboards.
+* Static adapter synthesis, heavy runtime validation, or complex compensation logic.
+* Hexagonal/ports explosion; keep layers minimal.
+
+---
+
+## 2) High‑Level Architecture
+
+```
+Clients ──▶ HTTP API ──▶ application.usecases
+                           │
+                           ├─ FlowOrchestrator  (state machine + event loop)
+                           │     ├─ uses services.EdgeDecisionService (edge LLM)
+                           │     ├─ uses services.Runners (Program/Ai/Human)
+                           │     └─ uses repositories.* (persistence)
+                           │
+                           ├─ SubmitHumanTask   (accepts human result, resumes)
+                           └─ GetRunStatus      (returns FlowRun.context)
+
+application.services  → pure logic + external I/O contracts
+application.repositories → persistence abstraction
+
+infrastructure/ → adapters (Prisma repos, HTTP server, LLM client, optional worker)
+domain/ → Prisma client (generated)
+```
+
+**Key separation:** the **usecase** holds orchestration and state transitions; **services** perform external I/O (LLM, HTTP calls, human task creation); **repositories** read/write persistence.
+
+---
+
+## 3) Directory Layout (coarse)
+
+```
+.
+├─ prisma/                 # Prisma schema & migrations
+├─ src/
+│  ├─ application/
+│  │  ├─ usecases/
+│  │  │  ├─ FlowOrchestrator/
+│  │  │  ├─ SubmitHumanTask/
+│  │  │  └─ GetRunStatus/
+│  │  ├─ services/
+│  │  │  ├─ EdgeDecisionService/
+│  │  │  └─ Runners/            # ProgramRunner / AiRunner / HumanTaskService
+│  │  └─ repositories/          # Flow / FlowRun / NodeRun / HumanTask / DecisionLog
+│  ├─ infrastructure/           # Prisma repos, HTTP server, LLM adapter, (optional) queue
+│  └─ domain/                   # Prisma-generated client (no handwritten code)
+└─ .env
+```
+
+Rules:
+
+* Dependencies flow **one way**: `usecases → services → repositories`.
+* `application` does not import from `infrastructure`; adapters are injected.
+
+---
+
+## 4) Data Model (logical)
+
+> Prisma schema exists separately; this section defines intent and invariants.
+
+### Flow
+
+* `name`, `version`
+* `nodes: Node[]` (inline)
+
+  * `key` (unique within flow)
+  * `kind`: `program | ai | human`
+  * `requires?: string[]` (all must be finished as `ok` or `skipped` for the node to become ready)
+  * `input_schema: JSON` (JSON Schema 2020‑12)
+  * `output_schema: JSON`
+  * `program` fields: `endpoint { method, url, headers?, body_template? }`
+  * `ai` fields: `model`, `system?`, `format: "json"`
+  * `human` fields: `blocking? (default true)`, `assignees?`, `timeout_sec?`, `ui_hint? { message?, fields? }`
+
+### FlowRun
+
+* `flowId`, `status`: `queued | running | waiting | completed | failed`
+* `input: JSON`
+* `context: JSON` (live, externally readable)
+
+  * `vars: Record<string, any>`
+  * `node_results: { [nodeKey]: { status, output?, error?, finishedAt? } }`
+  * `started_at`, `updated_at`
+
+### NodeRun
+
+* `flowRunId`, `nodeKey`, `nodeType`
+* `status`: `queued | running | ok | error | skipped | waiting_human`
+* `input`, `output?`, `error?`, timestamps
+
+### HumanTask
+
+* `flowRunId`, `nodeKey`
+* `status`: `pending | submitted | expired | canceled`
+* `message?`, `fields?`, `prefill?`, `result?`
+* `assignees: string[]`, `blocking: boolean (default true)`
+* `token` (unique, for the lightweight form), `expiresAt?`
+
+### DecisionLog
+
+* `flowRunId`, `atNodeKey?`, `decision: JSON`
+
+  * Shape: `{ mode, next: [{nodeKey,input,human?}], skips?: string[], reason?: string }`
+
+**Indexes (recommended)**
+`FlowRun`: by `flowId` and (`status`, `updatedAt`)
+`NodeRun`: by (`flowRunId`, `nodeKey`) and (`status`, `finishedAt`)
+`HumanTask`: by `flowRunId`, `status`, `expiresAt`
+`DecisionLog`: by `flowRunId`, `createdAt`
+
+---
+
+## 5) Flow Definition Contract
+
+The flow is a single JSON document. Execution order is **declarative** via `requires`.
+Conditionals are handled at runtime by the edge LLM (by choosing a subset of ready nodes to run and marking others `skipped`).
+Joins are expressed naturally by listing multiple `requires`.
+
+* A → {B, C} → D:
+
+  * `B.requires = ["A"]`, `C.requires = ["A"]`, `D.requires = ["B","C"]`
+
+The JSON Schemas in `input_schema` and `output_schema` are the **source of truth** for types.
+
+---
+
+## 6) Edge LLM Contract (runtime only)
+
+**Input** (from FlowOrchestrator):
+
+* Flow meta (name, version)
+* **Ready set**: array of nodes that satisfy `requires` and are not finished
+
+  * For each: `key`, `kind`, `input_schema` (+ optional title/description)
+* Context snapshot:
+
+  * `input`, `vars`, `completed: Array<{ key, output }>`
+* `last`: `{ key, output } | null` (the most recently completed node, if any)
+
+**Output** (from LLM):
+
+```json
+{
+  "mode": "next" | "parallel" | "stop",
+  "next": [
+    { "nodeKey": "B", "input": { /* conforms to B.input_schema */ } },
+    { "nodeKey": "C", "input": { /* ... */ }, "human": { "message": "...", "fields": [/* optional */] } }
+  ],
+  "skips": ["X","Y"],            // ready nodes to mark as skipped
+  "reason": "short human-readable rationale"
+}
+```
+
+**Validation policy (MVP):**
+
+* The engine does **not** run heavy validation. It makes **one correction attempt** if the decision JSON is malformed or obviously missing required fields. If still invalid, the run fails.
+
+---
+
+## 7) Human‑in‑the‑Loop
+
+* A `human` node in `next` creates a `HumanTask` and a `NodeRun(status=waiting_human)`.
+* If `blocking=true`, the orchestrator sets `FlowRun.status=waiting` and stops scheduling until submission.
+* Submission (via tokenized endpoint) stores `result` into the `HumanTask`, updates the corresponding `NodeRun` to `ok` with `output=result`, writes to `context.node_results[H]`, flips the run back to `running`, and re‑enters the loop.
+
+Timeout behavior (MVP): mark task `expired`, node `error`, run `failed`.
+
+---
+
+## 8) Orchestrator Lifecycle (single usecase)
+
+**FlowOrchestrator** owns the event loop (“pump”):
+
+1. **Block check**
+   If a pending, blocking HumanTask exists, set run to `waiting` and exit.
+2. **Compute ready set**
+   Nodes not finished where all `requires` are `ok` or `skipped`.
+3. **Completion check**
+   If no ready nodes, no unfinished nodes, and no pending human tasks, set `completed`.
+4. **Decision step**
+   Call edge LLM with ready set, last output, and context. Persist a `DecisionLog`.
+
+   * On malformed response: one re‑ask. If still bad → `failed`.
+5. **Apply skips**
+   Persist `NodeRun(status=skipped)` for items in `skips`; update `context`.
+6. **Dispatch**
+   For each item in `next`:
+
+   * `program` → ProgramRunner (HTTP call)
+   * `ai` → AiRunner (LLM call, JSON expected)
+   * `human` → HumanTaskService (create task; if blocking, set run `waiting`)
+7. **Wait for events**
+   Nodes finish or a human submits; the orchestrator is invoked again to continue.
+
+**State transitions**
+
+| Target         | from → to                  | Trigger                                                      |
+| -------------- | -------------------------- | ------------------------------------------------------------ |
+| FlowRun.status | running → waiting          | blocking HumanTask created                                   |
+| FlowRun.status | waiting → running          | HumanTask submitted                                          |
+| FlowRun.status | running → completed        | No ready/unfinished nodes; LLM returned stop/empty           |
+| FlowRun.status | any → failed               | LLM decision invalid (after one retry) or runner fatal error |
+| NodeRun.status | queued → running → ok      | Runner success                                               |
+| NodeRun.status | queued → running → error   | Runner error                                                 |
+| NodeRun.status | none → skipped             | LLM `skips`                                                  |
+| NodeRun.status | none → waiting\_human → ok | Human task pending → submitted                               |
+
+---
+
+## 9) API Surface (minimal)
+
+* `POST /flows/{id}/runs` → start a run (creates `FlowRun`, enters loop)
+* `GET  /runs/{runId}` → return **FlowRun.context** and a summary of node runs
+* `GET  /human-tasks/{token}` → fetch a pending human task (for a lightweight form)
+* `POST /human-tasks/{token}/submit` → submit human result and resume
+* `GET  /runs/{runId}/decisions` → audit decision logs (optional)
+
+Auth, notifications, and UI are out of scope for MVP.
+
+---
+
+## 10) Concurrency & Scheduling
+
+* Parallelism emerges when the ready set has multiple nodes and the LLM returns `next` with multiple items.
+* Human tasks with `blocking=false` allow other branches to proceed while the task waits.
+* To avoid race conditions on `context`, updates for a given run should be serialized (e.g., per‑run queue or optimistic writes with retry).
+
+---
+
+## 11) Error Handling (MVP)
+
+* **Program node:** HTTP/network/parse error → `NodeRun=error`, `FlowRun=failed`.
+* **AI node:** non‑JSON or missing required fields → one re‑ask → if still invalid, `error` → `failed`.
+* **Edge LLM:** malformed decision JSON → one re‑ask → if still invalid, `failed`.
+* **Human task:** expired → `expired`, node `error`, run `failed`.
+
+---
+
+## 12) Persistence & Observability
+
+* Persist all transitions immediately:
+
+  * `FlowRun` (status + `context`)
+  * `NodeRun`
+  * `HumanTask`
+  * `DecisionLog`
+* Minimal logs (request IDs, run IDs, node keys, durations).
+  Dashboards are out of scope; the primary view is `FlowRun.context`.
+
+---
+
+## 13) Security & Config (MVP)
+
+* Assume trusted internal callers.
+* Store only necessary fields in `context`.
+* Use environment variables for LLM keys and DB connection.
+* TLS for external HTTP calls.
+
+---
+
+## 14) Pre‑Run Validations (lightweight)
+
+* Detect obvious DAG issues at flow creation: duplicate keys, unknown `requires`, cycles.
+* Optionally lint JSON Schemas for presence of `$schema`, `type`, and `required` sets.
+
+---
+
+## 15) Acceptance Criteria
+
+* A flow with inline nodes and JSON Schemas can be created.
+* A run can be started, and its **context** is observable via API at any time.
+* The orchestrator:
+
+  * Computes ready sets from `requires`
+  * Uses edge LLM to choose nodes and produce typed inputs
+  * Marks nodes as `skipped` when indicated
+  * Creates and waits on `human` nodes, then resumes
+* Happy path finishes with `completed`; fatal errors lead to `failed`.
+* No notifications or advanced validation required for MVP.
+
+---
+
+This document defines the **current** architecture: a single‑usecase orchestrator that owns the lifecycle, minimal services for LLM and node execution, formal JSON Schemas embedded in the flow, context persisted for external visibility, and a native `human` node for pauses.
